@@ -104,6 +104,12 @@ pub struct Metrics {
     )]
     pub rpc_get_block_transaction_count_by_number: Counter,
 
+    /// Count of times flashblocks `estimate_gas_with_access_list` is called.
+    #[metric(
+        describe = "Count of times flashblocks estimate_gas_with_access_list is called"
+    )]
+    pub rpc_estimate_gas_with_access_list: Counter,
+
     /// Time taken to clone bundle state.
     #[metric(describe = "Time taken to clone bundle state")]
     pub bundle_state_clone_duration: Histogram,

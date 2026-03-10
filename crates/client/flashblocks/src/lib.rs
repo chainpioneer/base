@@ -52,6 +52,6 @@ pub use config::FlashblocksConfig;
 
 mod rpc;
 pub use rpc::{
-    BaseSubscriptionKind, EthApiExt, EthApiOverrideServer, EthPubSub, EthPubSubApiServer,
-    ExtendedSubscriptionKind, TransactionWithLogs,
+    BaseApiServer, BaseSubscriptionKind, EthApiExt, EthApiOverrideServer, EthPubSub,
+    EthPubSubApiServer, ExtendedSubscriptionKind, TransactionWithLogs,
 };
