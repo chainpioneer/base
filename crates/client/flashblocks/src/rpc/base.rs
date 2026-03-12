@@ -13,7 +13,10 @@ use jsonrpsee::{
 use op_alloy_network::Optimism;
 use op_alloy_rpc_types::OpTransactionRequest;
 use reth_evm::env::BlockEnvironment;
-use reth_rpc_eth_api::helpers::{EthCall, FullEthApi, LoadState};
+use reth_rpc_eth_api::helpers::{
+    EthCall, FullEthApi, LoadState, SpawnBlocking,
+    estimate::EstimateCall,
+};
 use tracing::debug;
 
 use crate::{FlashblocksAPI, PendingBlocksAPI};
@@ -24,10 +27,10 @@ use super::eth::EthApiExt;
 #[cfg_attr(not(test), rpc(server, namespace = "base"))]
 #[cfg_attr(test, rpc(server, client, namespace = "base"))]
 pub trait BaseApi {
-    /// Creates an access list and returns gas used with the access list applied.
+    /// Creates an access list and estimates gas using the generated access list.
     ///
-    /// Like `eth_createAccessList` but with `blockOverrides` support like `eth_call`.
-    /// The returned `gas_used` is from execution with the access list applied.
+    /// Combines `eth_createAccessList` and `eth_estimateGas` into a single call,
+    /// with support for `blockOverrides` like `eth_call`.
     #[method(name = "createAccessList")]
     async fn create_access_list(
         &self,
@@ -105,17 +108,44 @@ where
             }
         }
 
-        // Create access list and get gas_used with the access list applied.
-        // Internally runs the tx twice: once to discover the access list,
-        // once with it applied to get accurate gas_used.
-        EthCall::create_access_list_with(
+        // Step 1: Create access list with block-overrides-modified evm_env
+        let acl_result = EthCall::create_access_list_with(
             eth_api,
-            evm_env,
+            evm_env.clone(),
             at,
-            transaction,
-            Some(final_overrides),
+            transaction.clone(),
+            Some(final_overrides.clone()),
         )
         .await
-        .map_err(Into::into)
+        .map_err(Into::into)?;
+
+        // If access list creation failed, return early with the error
+        if acl_result.error.is_some() {
+            return Ok(acl_result);
+        }
+
+        // Step 2: Set access list on the transaction and estimate gas
+        let mut tx_with_acl = transaction;
+        tx_with_acl.as_mut().access_list = Some(acl_result.access_list.clone());
+
+        // Run gas estimation in a blocking context (same pattern as estimate_gas_at)
+        let gas = SpawnBlocking::spawn_blocking_io_fut(eth_api, move |api| async move {
+            let state = LoadState::state_at_block_id(&api, at).await?;
+            EstimateCall::estimate_gas_with(
+                &api,
+                evm_env,
+                tx_with_acl,
+                state,
+                Some(final_overrides),
+            )
+        })
+        .await
+        .map_err(Into::into)?;
+
+        Ok(AccessListResult {
+            access_list: acl_result.access_list,
+            gas_used: gas,
+            error: None,
+        })
     }
 }
