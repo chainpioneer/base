@@ -1,5 +1,7 @@
 //! Base namespace RPC trait definitions and implementations.
 
+use std::future::Future;
+
 use alloy_eips::{eip2930::AccessListResult, BlockId};
 use alloy_primitives::U256;
 use alloy_rpc_types::{
@@ -12,7 +14,7 @@ use jsonrpsee::{
 };
 use op_alloy_network::Optimism;
 use op_alloy_rpc_types::OpTransactionRequest;
-use reth_evm::env::BlockEnvironment;
+use reth_evm::{EvmEnvFor, env::BlockEnvironment};
 use reth_rpc_eth_api::helpers::{EthCall, FullEthApi, LoadState};
 use tracing::debug;
 
@@ -125,17 +127,16 @@ where
         let mut tx_with_acl = transaction;
         tx_with_acl.as_mut().access_list = Some(acl_result.access_list.clone());
 
-        // Get state at the resolved block
-        let state =
-            LoadState::state_at_block_id(eth_api, at).await.map_err(Into::into)?;
-
         // Run gas estimation in a blocking context
-        let gas = eth_api
-            .spawn_blocking_io(move |api| {
-                api.estimate_gas_with(evm_env, tx_with_acl, state, Some(final_overrides))
-            })
-            .await
-            .map_err(Into::into)?;
+        let gas = spawn_estimate_gas(
+            eth_api,
+            evm_env,
+            tx_with_acl,
+            at,
+            Some(final_overrides),
+        )
+        .await
+        .map_err(Into::into)?;
 
         Ok(AccessListResult {
             access_list: acl_result.access_list,
@@ -143,4 +144,25 @@ where
             error: None,
         })
     }
+}
+
+/// Estimates gas with a pre-built EVM environment in a blocking IO context.
+///
+/// Extracted as a free function returning `impl Future` to avoid higher-ranked
+/// lifetime errors that occur when `spawn_blocking_io_fut` is called inside
+/// an `#[async_trait]` method (same pattern as `EstimateCall::estimate_gas_at`).
+fn spawn_estimate_gas<Eth>(
+    eth_api: &Eth,
+    evm_env: EvmEnvFor<Eth::Evm>,
+    request: OpTransactionRequest,
+    at: BlockId,
+    state_override: Option<StateOverride>,
+) -> impl Future<Output = Result<U256, Eth::Error>> + Send + '_
+where
+    Eth: FullEthApi<NetworkTypes = Optimism> + Send + Sync + 'static,
+{
+    eth_api.spawn_blocking_io_fut(move |this| async move {
+        let state = this.state_at_block_id(at).await?;
+        this.estimate_gas_with(evm_env, request, state, state_override)
+    })
 }
