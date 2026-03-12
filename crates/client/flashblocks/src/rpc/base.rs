@@ -125,10 +125,13 @@ where
         let mut tx_with_acl = transaction;
         tx_with_acl.as_mut().access_list = Some(acl_result.access_list.clone());
 
-        // Run gas estimation in a blocking context (same pattern as estimate_gas_at)
+        // Get state at the resolved block
+        let state =
+            LoadState::state_at_block_id(eth_api, at).await.map_err(Into::into)?;
+
+        // Run gas estimation in a blocking context
         let gas = eth_api
-            .spawn_blocking_io_fut(move |api| async move {
-                let state = api.state_at_block_id(at).await?;
+            .spawn_blocking_io(move |api| {
                 api.estimate_gas_with(evm_env, tx_with_acl, state, Some(final_overrides))
             })
             .await
