@@ -13,10 +13,7 @@ use jsonrpsee::{
 use op_alloy_network::Optimism;
 use op_alloy_rpc_types::OpTransactionRequest;
 use reth_evm::env::BlockEnvironment;
-use reth_rpc_eth_api::helpers::{
-    EthCall, FullEthApi, LoadState, SpawnBlocking,
-    estimate::EstimateCall,
-};
+use reth_rpc_eth_api::helpers::{EthCall, FullEthApi, LoadState};
 use tracing::debug;
 
 use crate::{FlashblocksAPI, PendingBlocksAPI};
@@ -129,18 +126,13 @@ where
         tx_with_acl.as_mut().access_list = Some(acl_result.access_list.clone());
 
         // Run gas estimation in a blocking context (same pattern as estimate_gas_at)
-        let gas = SpawnBlocking::spawn_blocking_io_fut(eth_api, move |api| async move {
-            let state = LoadState::state_at_block_id(&api, at).await?;
-            EstimateCall::estimate_gas_with(
-                &api,
-                evm_env,
-                tx_with_acl,
-                state,
-                Some(final_overrides),
-            )
-        })
-        .await
-        .map_err(Into::into)?;
+        let gas = eth_api
+            .spawn_blocking_io_fut(move |api| async move {
+                let state = api.state_at_block_id(at).await?;
+                api.estimate_gas_with(evm_env, tx_with_acl, state, Some(final_overrides))
+            })
+            .await
+            .map_err(Into::into)?;
 
         Ok(AccessListResult {
             access_list: acl_result.access_list,
