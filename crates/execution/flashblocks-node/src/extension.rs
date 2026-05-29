@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use base_flashblocks::{
-    EthApiExt, EthApiOverrideServer, EthPubSub, EthPubSubApiServer, FlashblocksConfig,
-    FlashblocksSubscriber,
+    BaseApiServer, EthApiExt, EthApiOverrideServer, EthPubSub, EthPubSubApiServer,
+    FlashblocksConfig, FlashblocksSubscriber,
 };
 use base_node_runner::{BaseNodeExtension, FromExtensionConfig, NodeHooks};
 use reth_chain_state::CanonStateSubscriptions;
@@ -74,7 +74,15 @@ impl BaseNodeExtension for FlashblocksExtension {
                 ctx.registry.eth_handlers().filter.clone(),
                 Arc::clone(&state_for_rpc),
             );
-            ctx.modules.replace_configured(api_ext.into_rpc())?;
+            ctx.modules.replace_configured(EthApiOverrideServer::into_rpc(api_ext))?;
+
+            // Register the base namespace API (base_createAccessList, etc.)
+            let base_api = EthApiExt::new(
+                ctx.registry.eth_api().clone(),
+                ctx.registry.eth_handlers().filter.clone(),
+                Arc::clone(&state_for_rpc),
+            );
+            ctx.modules.merge_configured(BaseApiServer::into_rpc(base_api))?;
 
             // Register the eth_subscribe subscription endpoint for flashblocks
             // Uses replace_configured since eth_subscribe already exists from reth's standard module
