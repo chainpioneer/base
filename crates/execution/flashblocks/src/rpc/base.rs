@@ -104,6 +104,13 @@ where
         let (mut evm_env, at) =
             LoadState::evm_env_at(eth_api, block_id).await.map_err(Into::into)?;
 
+        // Disable the EIP-7825 per-transaction gas cap (2^24), matching reth's
+        // eth_call/eth_estimateGas/eth_simulateV1 RPC paths. The cap is a block-inclusion
+        // rule, not a simulation constraint; without this, requests with gas above the cap
+        // fail with "intrinsic gas too high" during both access-list creation and gas
+        // estimation. This applies to the cloned evm_env used by both helper calls below.
+        evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+
         // Apply block overrides to the EVM block environment. Mirrors the scalar-field
         // handling of `alloy_evm::overrides::apply_block_overrides`; block-hash overrides
         // are not supported here because the access-list helper builds its own state db
