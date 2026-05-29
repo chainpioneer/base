@@ -178,6 +178,16 @@ impl<Eth: EthApiTypes, FB> EthApiExt<Eth, FB> {
     pub const fn new(eth_api: Eth, eth_filter: EthFilter<Eth>, flashblocks_state: Arc<FB>) -> Self {
         Self { eth_api, eth_filter, flashblocks_state }
     }
+
+    /// Returns a reference to the underlying Eth API.
+    pub const fn eth_api(&self) -> &Eth {
+        &self.eth_api
+    }
+
+    /// Returns a reference to the flashblocks state.
+    pub const fn flashblocks_state(&self) -> &Arc<FB> {
+        &self.flashblocks_state
+    }
 }
 
 #[async_trait]

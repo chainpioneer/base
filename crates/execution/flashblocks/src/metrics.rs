@@ -46,6 +46,8 @@ base_metrics::define_metrics! {
     rpc_get_logs: counter,
     #[describe("Count of times flashblocks get_block_transaction_count_by_number is called")]
     rpc_get_block_transaction_count_by_number: counter,
+    #[describe("Count of times flashblocks base_createAccessList is called")]
+    rpc_base_create_access_list: counter,
     #[describe("Time taken to clone bundle state")]
     bundle_state_clone_duration: histogram,
     #[describe("Size of bundle state being cloned (number of accounts)")]
