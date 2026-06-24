@@ -6,7 +6,7 @@ use alloy_eips::{BlockId, eip2930::AccessListResult};
 use alloy_primitives::U256;
 use alloy_rpc_types::{
     BlockOverrides,
-    state::{StateOverride, StateOverridesBuilder},
+    state::{EvmOverrides, StateOverride, StateOverridesBuilder},
 };
 use base_common_network::Base;
 use base_common_rpc_types::BaseTransactionRequest;
@@ -58,7 +58,7 @@ where
     ) -> impl Future<Output = Result<U256, Eth::Error>> + Send + '_ {
         self.eth_api().spawn_blocking_io_fut(move |this| async move {
             let state = this.state_at_block_id(at).await?;
-            this.estimate_gas_with(evm_env, request, state, state_override)
+            this.estimate_gas_with(evm_env, request, state, EvmOverrides::state(state_override))
         })
     }
 }
