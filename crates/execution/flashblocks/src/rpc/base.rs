@@ -8,8 +8,7 @@ use alloy_rpc_types::{
     BlockOverrides,
     state::{EvmOverrides, StateOverride, StateOverridesBuilder},
 };
-use base_common_network::Base;
-use base_common_rpc_types::BaseTransactionRequest;
+use base_common_rpc_types::{BaseRpcTypes, BaseTransactionRequest};
 use jsonrpsee::{
     core::{RpcResult, async_trait},
     proc_macros::rpc,
@@ -41,7 +40,7 @@ pub trait BaseApi {
 
 impl<Eth, FB> EthApiExt<Eth, FB>
 where
-    Eth: FullEthApi<NetworkTypes = Base> + Send + Sync + 'static,
+    Eth: FullEthApi<NetworkTypes = BaseRpcTypes> + Send + Sync + 'static,
 {
     /// Estimates gas with a pre-built EVM environment in a blocking IO context.
     ///
@@ -66,7 +65,7 @@ where
 #[async_trait]
 impl<Eth, FB> BaseApiServer for EthApiExt<Eth, FB>
 where
-    Eth: FullEthApi<NetworkTypes = Base> + Send + Sync + 'static,
+    Eth: FullEthApi<NetworkTypes = BaseRpcTypes> + Send + Sync + 'static,
     FB: FlashblocksAPI + Send + Sync + 'static,
     jsonrpsee_types::error::ErrorObject<'static>: From<Eth::Error>,
 {
