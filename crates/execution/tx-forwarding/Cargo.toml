@@ -32,9 +32,9 @@ serde.workspace = true
 futures.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-serde_json.workspace = true
 tokio-util.workspace = true
 metrics = { workspace = true, optional = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 tokio = { workspace = true, features = ["sync", "rt", "time"] }
 jsonrpsee = { workspace = true, features = ["http-client"] }
 
@@ -48,13 +48,16 @@ alloy-consensus.workspace = true
 # workspace
 base-test-utils.workspace = true
 base-txpool-rpc.workspace = true
+base-txpool-tracing.workspace = true
 base-common-consensus.workspace = true
 base-common-rpc-types.workspace = true
 base-execution-chainspec.workspace = true
 base-node-runner = { workspace = true, features = ["test-utils"] }
+base-observability-events = { workspace = true, features = ["test-utils"] }
 
 # misc
 eyre.workspace = true
+rstest.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 jsonrpsee = { workspace = true, features = ["server"] }

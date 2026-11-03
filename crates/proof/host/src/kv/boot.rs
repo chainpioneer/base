@@ -42,7 +42,7 @@ impl KeyValueStore for BootKeyValueStore {
             }
             PROPOSER_KEY => Some(self.cfg.request.proposer.to_vec()),
             INTERMEDIATE_BLOCK_INTERVAL_KEY => {
-                Some(self.cfg.request.intermediate_block_interval.to_be_bytes().to_vec())
+                Some(self.cfg.request.intermediate_block_interval.get().to_be_bytes().to_vec())
             }
             L1_HEAD_NUMBER_KEY => Some(self.cfg.request.l1_head_number.to_be_bytes().to_vec()),
             L2_SCHEDULE_BLOCK_NUMBER_KEY => {

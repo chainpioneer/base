@@ -464,17 +464,15 @@ pub struct Behaviour {
     pub ping: libp2p::ping::Behaviour,
     pub gossipsub: libp2p::gossipsub::Behaviour,
     pub identify: libp2p::identify::Behaviour,
-    pub sync_req_resp: libp2p_stream::Behaviour,
 }
 ```
 
 The `ping` behaviour sends periodic keepalive pings to connected peers and measures round-trip
 times. The `gossipsub` behaviour handles the actual block gossip. The `identify` behaviour exchanges
 capability information between peers when they first connect (the Base node advertises its agent
-version as `"base"`). The `sync_req_resp` behaviour supports a legacy request-response protocol
-called `payload_by_number` that is part of the legacy rollup P2P spec. This is being deprecated, and the Base
-implementation responds with "not found" to all requests, but it is still present so that legacy
-peers don't penalize Base nodes for not supporting it.
+version as `"base"`). Base does not support the legacy op-node `payload_by_number`
+request-response protocol. Consensus-layer block propagation uses GossipSub; execution-layer
+block synchronization and follow mode's HTTP payload fetching are separate paths.
 
 The `GossipDriver`
 ([`gossip/src/driver.rs`](https://github.com/base/base/blob/main/crates/consensus/gossip/src/driver.rs))
@@ -699,7 +697,8 @@ polls the transaction pool for new pending transactions and queues them through 
 `tokio::mpsc` channel. The
 [`DestinationForwarder`](https://github.com/base/base/blob/main/crates/execution/tx-forwarding/src/forwarder/task.rs)
 receives queued transactions and forwards them via a custom JSON-RPC method
-(`base_insertValidatedTransactions`) to configured builder endpoints. One forwarder task is spawned
+(`base_insertValidatedTransaction`, or one `base_insertValidatedTransactions` call per batch with
+`--tx-forwarding-batched-insert`) to configured builder endpoints. One forwarder task is spawned
 per builder URL, so multiple downstream builders can receive transactions simultaneously. This
 pipeline runs as background tasks on the node's task executor.
 

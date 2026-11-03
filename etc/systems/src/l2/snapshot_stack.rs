@@ -8,10 +8,11 @@ use std::{
 use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types_engine::JwtSecret;
 use alloy_rpc_types_eth::SyncStatus as EthSyncStatus;
-use base_common_genesis::{BaseUpgrade, RollupConfig};
+use base_common_genesis::{BaseUpgrade, RollupConfig, SystemConfig};
 use base_common_network::Base;
 use base_consensus_node::StandalonePrefund;
 use base_execution_chainspec::BaseChainSpec;
+use base_execution_txpool::ValiditySignatureMode;
 use eyre::{Result, WrapErr, ensure};
 use reth_ethereum_forks::ForkCondition;
 use url::Url;
@@ -19,8 +20,8 @@ use url::Url;
 use super::{
     ChainSpecSource, InProcessBuilder, InProcessBuilderConfig, InProcessClient,
     InProcessClientConfig, InProcessFollowConsensus, InProcessFollowConsensusConfig,
-    InProcessStandaloneSequencer, InProcessStandaloneSequencerConfig, L2ContainerConfig,
-    SnapshotBoundary,
+    InProcessNodeRuntime, InProcessStandaloneSequencer, InProcessStandaloneSequencerConfig,
+    L2ContainerConfig, SnapshotBoundary,
 };
 use crate::{DevnetBlockInterval, DevnetSnapshotConfig};
 
@@ -57,6 +58,7 @@ pub struct SnapshotL2Stack {
     follow_consensus: Option<InProcessFollowConsensus>,
     follow_config: Option<InProcessFollowConsensusConfig>,
     block_interval: DevnetBlockInterval,
+    block_gas_limit: u64,
     rollup_config: Arc<RollupConfig>,
     chain_id: u64,
 }
@@ -89,6 +91,7 @@ impl SnapshotL2Stack {
         let jwt_secret = JwtSecret::random();
 
         let builder = InProcessBuilder::start(InProcessBuilderConfig {
+            runtime: InProcessNodeRuntime::Host,
             chain_spec: Arc::clone(&chain_spec),
             datadir: Some(config.snapshot.builder_datadir),
             jwt_secret,
@@ -99,9 +102,9 @@ impl SnapshotL2Stack {
             flashblocks_port: container.and_then(|value| value.builder_flashblocks_port),
             metrics_port: None,
             block_time: block_interval.duration(),
-            enable_experimental_validity_transactions: false,
             payload_builder_cutover: block_interval == DevnetBlockInterval::TwoHundredMilliseconds,
             extra_extensions: Vec::new(),
+            validity_signature_mode: ValiditySignatureMode::Off,
             persistence_threshold: Some(0),
             persistence_backpressure_threshold: Some(snapshot_persistence_backpressure_threshold(
                 block_interval,
@@ -124,6 +127,13 @@ impl SnapshotL2Stack {
             first_block_timestamp > boundary.head.timestamp,
             "snapshot boundary timestamp must be earlier than the local schedule anchor"
         );
+        let system_config = Self::with_snapshot_overrides(
+            boundary.system_config,
+            block_interval,
+            config.snapshot.block_gas_limit,
+            config.snapshot.eip1559_elasticity_override,
+        );
+        let block_gas_limit = system_config.gas_limit;
         let rollup_config = Arc::new(Self::anchored_rollup_config(
             (*canonical_rollup_config).clone(),
             boundary.head.number,
@@ -132,6 +142,7 @@ impl SnapshotL2Stack {
         )?);
 
         let client = InProcessClient::start(InProcessClientConfig {
+            runtime: InProcessNodeRuntime::Host,
             chain_spec: ChainSpecSource::Parsed(chain_spec),
             datadir: Some(config.snapshot.client_datadir),
             jwt_secret,
@@ -150,8 +161,8 @@ impl SnapshotL2Stack {
             )),
             tx_forwarding_config: None,
             upgrade_signal: None,
-            enable_experimental_validity_transactions: false,
             extra_extensions: Vec::new(),
+            validity_signature_mode: ValiditySignatureMode::Off,
         })
         .await
         .wrap_err("failed to start snapshot client")?;
@@ -182,7 +193,7 @@ impl SnapshotL2Stack {
                 jwt_secret,
                 l2_engine_url: builder.engine_url()?,
                 l1_info: boundary.l1_info,
-                system_config: boundary.system_config,
+                system_config,
                 prefund,
             })
             .await
@@ -210,6 +221,7 @@ impl SnapshotL2Stack {
             follow_consensus: None,
             follow_config: Some(follow_config),
             block_interval,
+            block_gas_limit,
             rollup_config: canonical_rollup_config,
             chain_id: chain.l2_chain_id,
         })
@@ -249,6 +261,9 @@ impl SnapshotL2Stack {
     }
 
     /// Anchors the deterministic local block schedule at the first post-snapshot block.
+    ///
+    /// The two-second cadence keeps the legacy schedule, so it clears any configured Denim
+    /// activation and rejects snapshot heads that are already past Denim.
     pub fn anchored_rollup_config(
         mut config: RollupConfig,
         boundary_number: u64,
@@ -258,6 +273,12 @@ impl SnapshotL2Stack {
         let first_block_number = boundary_number
             .checked_add(1)
             .ok_or_else(|| eyre::eyre!("snapshot boundary block number overflow"))?;
+        if block_interval == DevnetBlockInterval::TwoSeconds {
+            ensure!(
+                !config.is_denim_active(config.l2_block_timestamp(boundary_number)),
+                "two-second snapshot continuation requires a pre-Denim snapshot head"
+            );
+        }
         let blocks_since_genesis = first_block_number
             .checked_sub(config.genesis.l2.number)
             .ok_or_else(|| eyre::eyre!("snapshot boundary predates configured L2 genesis"))?;
@@ -267,8 +288,13 @@ impl SnapshotL2Stack {
         config.genesis.l2_time = first_block_timestamp
             .checked_sub(legacy_elapsed)
             .ok_or_else(|| eyre::eyre!("snapshot is too far ahead to anchor locally"))?;
-        if block_interval == DevnetBlockInterval::TwoHundredMilliseconds {
-            config.set_upgrade_activation_timestamp(BaseUpgrade::Denim, first_block_timestamp);
+        match block_interval {
+            DevnetBlockInterval::TwoSeconds => {
+                config.clear_upgrade_activation_timestamp(BaseUpgrade::Denim);
+            }
+            DevnetBlockInterval::TwoHundredMilliseconds => {
+                config.set_upgrade_activation_timestamp(BaseUpgrade::Denim, first_block_timestamp);
+            }
         }
         let (planned_timestamp, planned_millis) =
             config.l2_block_timestamp_parts(first_block_number);
@@ -280,16 +306,37 @@ impl SnapshotL2Stack {
     }
 
     /// Builds the execution chain specification for a local snapshot schedule.
+    ///
+    /// Denim activates at the anchor for the 200ms cadence and never for the two-second cadence,
+    /// matching [`Self::anchored_rollup_config`].
     pub fn chain_spec(
         mut chain_spec: BaseChainSpec,
         first_block_timestamp: u64,
         block_interval: DevnetBlockInterval,
     ) -> BaseChainSpec {
-        if block_interval == DevnetBlockInterval::TwoHundredMilliseconds {
-            chain_spec
-                .set_fork(BaseUpgrade::Denim, ForkCondition::Timestamp(first_block_timestamp));
-        }
+        let denim = match block_interval {
+            DevnetBlockInterval::TwoSeconds => ForkCondition::Never,
+            DevnetBlockInterval::TwoHundredMilliseconds => {
+                ForkCondition::Timestamp(first_block_timestamp)
+            }
+        };
+        chain_spec.set_fork(BaseUpgrade::Denim, denim);
         chain_spec
+    }
+
+    /// Applies local snapshot overrides to the recovered system configuration.
+    fn with_snapshot_overrides(
+        mut system_config: SystemConfig,
+        block_interval: DevnetBlockInterval,
+        block_gas_limit: Option<u64>,
+        elasticity_override: Option<u32>,
+    ) -> SystemConfig {
+        system_config.gas_limit =
+            block_gas_limit.unwrap_or_else(|| block_interval.snapshot_block_gas_limit());
+        if let Some(elasticity) = elasticity_override {
+            system_config.eip1559_elasticity = Some(elasticity);
+        }
+        system_config
     }
 
     fn schedule_anchor(now: SystemTime) -> Result<u64> {
@@ -352,6 +399,11 @@ impl SnapshotL2Stack {
         self.block_interval
     }
 
+    /// Returns the block gas limit for locally produced descendants.
+    pub const fn block_gas_limit(&self) -> u64 {
+        self.block_gas_limit
+    }
+
     /// Returns the L2 chain ID of the continued snapshot.
     pub const fn chain_id(&self) -> u64 {
         self.chain_id
@@ -360,6 +412,11 @@ impl SnapshotL2Stack {
     /// Returns the builder RPC URL.
     pub fn builder_rpc_url(&self) -> Result<Url> {
         self.builder.rpc_url()
+    }
+
+    /// Returns the builder WebSocket RPC URL.
+    pub fn builder_ws_url(&self) -> Result<Url> {
+        self.builder.ws_url()
     }
 
     /// Returns the client RPC URL.
@@ -419,7 +476,7 @@ impl SnapshotL2Stack {
 #[cfg(test)]
 mod tests {
     use base_common_chains::{ChainConfig, Upgrades};
-    use base_common_genesis::BaseUpgrade;
+    use base_common_genesis::{BaseUpgrade, SystemConfig};
     use base_execution_chainspec::BaseChainSpec;
     use reth_ethereum_forks::ForkCondition;
 
@@ -454,6 +511,34 @@ mod tests {
 
         assert_eq!(config.l2_block_timestamp_parts(30_000_001), (2_000_000_000, 0));
         assert_eq!(config.l2_block_timestamp_parts(30_000_002), (2_000_000_002, 0));
+        assert!(!config.is_denim_active(u64::MAX));
+    }
+
+    #[test]
+    fn two_second_cl_and_el_never_activate_denim() {
+        let chain_spec = SnapshotL2Stack::chain_spec(
+            BaseChainSpec::mainnet(),
+            2_000_000_000,
+            DevnetBlockInterval::TwoSeconds,
+        );
+
+        assert_eq!(chain_spec.fork(BaseUpgrade::Denim), ForkCondition::Never);
+    }
+
+    #[test]
+    fn two_second_schedule_rejects_denim_snapshot_head() {
+        let mut canonical = ChainConfig::mainnet().rollup_config();
+        canonical.set_upgrade_activation_timestamp(BaseUpgrade::Denim, canonical.genesis.l2_time);
+
+        let error = SnapshotL2Stack::anchored_rollup_config(
+            canonical,
+            30_000_000,
+            2_000_000_000,
+            DevnetBlockInterval::TwoSeconds,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("pre-Denim snapshot head"));
     }
 
     #[test]
@@ -493,6 +578,50 @@ mod tests {
         assert!(!chain_spec.is_denim_active_at_timestamp(activation - 1));
         assert!(chain_spec.is_denim_active_at_timestamp(activation));
         assert_eq!(chain_spec.fork(BaseUpgrade::Denim), ForkCondition::Timestamp(activation));
+    }
+
+    #[test]
+    fn snapshot_overrides_replace_gas_limit_and_elasticity() {
+        let original = SystemConfig {
+            gas_limit: 1_200_000_000,
+            eip1559_denominator: Some(50),
+            eip1559_elasticity: Some(6),
+            min_base_fee: Some(5_000_000),
+            ..Default::default()
+        };
+
+        let overridden = SnapshotL2Stack::with_snapshot_overrides(
+            original,
+            DevnetBlockInterval::TwoSeconds,
+            Some(12_000_000_000),
+            Some(1),
+        );
+
+        assert_eq!(overridden.eip1559_elasticity, Some(1));
+        assert_eq!(overridden.eip1559_denominator, original.eip1559_denominator);
+        assert_eq!(overridden.gas_limit, 12_000_000_000);
+        assert_eq!(overridden.min_base_fee, original.min_base_fee);
+    }
+
+    #[test]
+    fn snapshot_gas_limit_defaults_follow_block_interval() {
+        let original = SystemConfig { gas_limit: 1_200_000_000, ..Default::default() };
+
+        let two_second = SnapshotL2Stack::with_snapshot_overrides(
+            original,
+            DevnetBlockInterval::TwoSeconds,
+            None,
+            None,
+        );
+        let subsecond = SnapshotL2Stack::with_snapshot_overrides(
+            original,
+            DevnetBlockInterval::TwoHundredMilliseconds,
+            None,
+            None,
+        );
+
+        assert_eq!(two_second.gas_limit, 10_000_000_000);
+        assert_eq!(subsecond.gas_limit, 1_000_000_000);
     }
 
     #[test]

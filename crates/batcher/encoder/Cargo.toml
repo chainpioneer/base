@@ -21,6 +21,7 @@ thiserror = { workspace = true, features = ["std"] }
 alloy-eips = { workspace = true, features = ["std"] }
 base-protocol = { workspace = true, features = ["std"] }
 derive_more = { workspace = true, features = ["debug"] }
+base-common-flz = { workspace = true, features = ["std"] }
 alloy-primitives = { workspace = true, features = ["std"] }
 rand = { workspace = true, features = ["std", "small_rng"] }
 base-common-consensus = { workspace = true, features = ["std"] }
@@ -29,8 +30,12 @@ clap = { workspace = true, features = ["derive"], optional = true }
 
 [dev-dependencies]
 rstest.workspace = true
+base-blobs.workspace = true
+futures = { workspace = true, features = ["executor"] }
 alloy-consensus = { workspace = true, features = ["std"] }
+base-consensus-derive = { workspace = true, features = ["test-utils"] }
 
 [features]
 clap = [ "dep:clap" ]
 metrics = [ "base-metrics/metrics", "dep:metrics" ]
+test-utils = []

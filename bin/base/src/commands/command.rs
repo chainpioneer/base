@@ -57,7 +57,8 @@ impl BaseCommand {
         match self {
             Self::Batcher(batcher) => {
                 chain_resolver.reject_for_reth_command("base batcher")?;
-                RuntimeManager::new().run_until_ctrl_c((*batcher).exec(metrics_enabled))
+                RuntimeManager::new()
+                    .run_until_shutdown(|cancel| (*batcher).exec(metrics_enabled, cancel))
             }
             Self::Bootnode(bootnode) => (*bootnode).run(chain_resolver.resolve()?, metrics_enabled),
             Self::Rpc(rpc) => (*rpc).run(chain_resolver.resolve()?),
@@ -66,7 +67,7 @@ impl BaseCommand {
             Self::Update(update) => (*update).run(),
             Self::Reth(reth) => {
                 chain_resolver.reject_for_reth_command("base reth")?;
-                (*reth).run()
+                reth.command.run()
             }
             Self::Proofs(command) => {
                 chain_resolver.reject_for_reth_command("base proofs")?;
@@ -76,7 +77,7 @@ impl BaseCommand {
             }
             Self::Snapshot(snapshot) => {
                 chain_resolver.reject_for_reth_command("base snapshot")?;
-                (*snapshot).run()
+                snapshot.command.run()
             }
         }
     }

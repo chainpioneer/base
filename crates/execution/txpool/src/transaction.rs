@@ -13,8 +13,11 @@ use alloy_eips::{
     eip7594::BlobTransactionSidecarVariant,
     eip7702::SignedAuthorization,
 };
-use alloy_primitives::{Address, B256, Bytes, TxHash, TxKind, U256};
-use base_common_consensus::{BaseTransactionSigned, Eip8130Constants, Eip8130Signed};
+use alloy_primitives::{Address, B256, Bytes, Signature, TxHash, TxKind, U256};
+use base_bundles::MeterBundleResponse;
+use base_common_consensus::{
+    BaseTransactionSigned, EIP8130_TX_TYPE_ID, Eip8130Constants, Eip8130Signed,
+};
 use c_kzg::KzgSettings;
 use reth_primitives_traits::{InMemorySize, SignedTransaction};
 use reth_transaction_pool::{
@@ -55,9 +58,10 @@ pub struct BasePooledTransaction<
     encoded_2718: OnceLock<Bytes>,
     /// Timestamp (millis since Unix epoch) when this transaction was received.
     received_at: u128,
-    /// State predicates that must hold before this transaction is eligible for
-    /// inclusion.
-    validity_predicates: Vec<crate::ValidityPredicate>,
+    /// Compiled conditions, shared across payload candidates; absent for ordinary transactions.
+    validity_conditions: Option<Arc<crate::ValidityConditions>>,
+    /// Sender authorization retained for builder forwarding.
+    validity_signature: Option<Signature>,
     /// The set of on-chain state surfaces whose change invalidates this
     /// transaction, computed once during validation and consumed by the pool's
     /// invalidation index. Empty until set; see [`crate::WatchSet`].
@@ -71,6 +75,13 @@ pub struct BasePooledTransaction<
     /// EIP-8130 validation. Unset for other transaction types; see
     /// [`crate::WatchManifest`].
     watch_manifest: OnceLock<crate::WatchManifest>,
+    /// In-process `meter_bundle` result, attached after sim and before pool insert.
+    ///
+    /// Behind [`Arc`] so [`Clone`] (payload-building `ParkableBestPayloadTransactions`)
+    /// stays a pointer bump once later PRs populate this. `None` on
+    /// sequencer/builder inserts and on mempool txs while inline simulation is
+    /// off. The later consumer only forwards `Some`.
+    metering: Option<Arc<MeterBundleResponse>>,
 }
 
 impl<Cons: SignedTransaction, Pooled> BasePooledTransaction<Cons, Pooled> {
@@ -93,32 +104,67 @@ impl<Cons: SignedTransaction, Pooled> BasePooledTransaction<Cons, Pooled> {
             _pd: core::marker::PhantomData,
             encoded_2718: Default::default(),
             received_at,
-            validity_predicates: Vec::new(),
+            validity_conditions: None,
+            validity_signature: None,
             watch_set: OnceLock::new(),
             limit_class: OnceLock::new(),
             watch_manifest: OnceLock::new(),
+            metering: None,
         }
+    }
+
+    /// Attaches an in-process `meter_bundle` result to this transaction.
+    #[must_use]
+    pub fn with_metering(mut self, metering: MeterBundleResponse) -> Self {
+        self.metering = Some(Arc::new(metering));
+        self
+    }
+
+    /// Returns the attached `meter_bundle` result, if any.
+    pub fn metering(&self) -> Option<&MeterBundleResponse> {
+        self.metering.as_deref()
     }
 
     /// Sets the validity predicates required for this transaction's inclusion.
     ///
-    /// Predicates are stored in canonical evaluation order (timing before
-    /// state) via [`crate::ValidityPredicate::sort_batch`], so every ingress
-    /// path yields transactions whose cheap timing predicates gate state reads.
+    /// Conditions are compiled once into timing bounds and separate state groups.
+    /// The submitted batch is retained only for lossless builder forwarding.
     #[must_use]
     pub fn with_validity_predicates(
         mut self,
-        mut validity_predicates: Vec<crate::ValidityPredicate>,
+        validity_predicates: Vec<crate::ValidityPredicate>,
     ) -> Self {
-        crate::ValidityPredicate::sort_batch(&mut validity_predicates);
-        self.validity_predicates = validity_predicates;
+        self.validity_conditions = (!validity_predicates.is_empty())
+            .then(|| Arc::new(crate::ValidityConditions::new(validity_predicates)));
+        self.validity_signature = None;
         self
     }
 
-    /// Returns the validity predicates required for this transaction's inclusion.
+    /// Returns the submitted predicates for lossless builder forwarding.
+    /// Pool and builder checks must use [`Self::validity_conditions`] instead.
     #[must_use]
     pub fn validity_predicates(&self) -> &[crate::ValidityPredicate] {
-        &self.validity_predicates
+        self.validity_conditions().submitted()
+    }
+
+    /// Returns compiled validity conditions for pool and builder checks.
+    #[must_use]
+    pub fn validity_conditions(&self) -> &crate::ValidityConditions {
+        self.validity_conditions.as_deref().unwrap_or_else(|| crate::ValidityConditions::empty())
+    }
+
+    /// Attaches a validity sidecar without verifying its signature.
+    /// Raw ingress must validate authorization first; builder insertion trusts its forwarder.
+    #[must_use]
+    pub fn with_validity(mut self, validity: crate::TransactionValidity) -> Self {
+        self = self.with_validity_predicates(validity.validity);
+        self.validity_signature = validity.validity_signature;
+        self
+    }
+
+    /// Returns the sender's validity-sidecar signature, if any.
+    pub const fn validity_signature(&self) -> Option<Signature> {
+        self.validity_signature
     }
 
     /// Returns the estimated compressed size of a transaction in bytes.
@@ -159,11 +205,22 @@ where
         replacement: &Self,
         price_bumps: &PriceBumpConfig,
     ) -> bool {
-        if self.validity_predicates().is_empty() || replacement.validity_predicates().is_empty() {
-            return price_bumps.is_replacement_underpriced(self, replacement);
+        if !self.validity_conditions().is_empty() && !replacement.validity_conditions().is_empty() {
+            return replacement.max_fee_per_gas() <= self.max_fee_per_gas();
         }
-
-        replacement.max_fee_per_gas() <= self.max_fee_per_gas()
+        if self.ty() == EIP8130_TX_TYPE_ID || replacement.ty() == EIP8130_TX_TYPE_ID {
+            // EIP-8130 requires both fee fields to rise by the bump, including
+            // when the replacement's priority fee is zero (which the default
+            // check exempts). The bump is keyed on the existing transaction's
+            // type, as in the default check, so a non-8130 transaction replaced
+            // by an 8130 one uses the non-8130 bump.
+            let bump = price_bumps.price_bump(self.ty());
+            let bumped = |fee: u128| fee.saturating_mul(100 + bump).div_ceil(100);
+            return replacement.max_fee_per_gas() < bumped(self.max_fee_per_gas())
+                || replacement.max_priority_fee_per_gas().unwrap_or_default()
+                    < bumped(self.max_priority_fee_per_gas().unwrap_or_default());
+        }
+        price_bumps.is_replacement_underpriced(self, replacement)
     }
 
     fn clone_into_consensus(&self) -> Recovered<Self::Consensus> {
@@ -227,16 +284,23 @@ impl<Cons: InMemorySize, Pooled> InMemorySize for BasePooledTransaction<Cons, Po
             .watch_manifest
             .get()
             .map_or(0, |manifest| core::mem::size_of_val(manifest.config_slots()));
-        let validity_predicates_size = core::mem::size_of_val(self.validity_predicates.as_slice());
+        let validity_predicates_size = self.validity_conditions.as_ref().map_or(0, |conditions| {
+            core::mem::size_of::<crate::ValidityConditions>() + conditions.heap_size()
+        });
+        let metering_size = self.metering.as_ref().map_or(0, |metering| {
+            core::mem::size_of::<MeterBundleResponse>() + metering.heap_size()
+        });
         self.inner.size()
             + core::mem::size_of::<u128>()
-            + core::mem::size_of::<Vec<crate::ValidityPredicate>>()
+            + core::mem::size_of::<Option<Arc<crate::ValidityConditions>>>()
             + core::mem::size_of::<OnceLock<crate::WatchSet>>()
             + watch_keys_size
             + core::mem::size_of::<OnceLock<crate::LimitClass>>()
             + core::mem::size_of::<OnceLock<crate::WatchManifest>>()
             + manifest_slots_size
             + validity_predicates_size
+            + core::mem::size_of::<Option<Arc<MeterBundleResponse>>>()
+            + metering_size
     }
 }
 
@@ -353,13 +417,21 @@ pub trait BasePooledTx: PoolTransaction + DataAvailabilitySized {
     /// Returns the EIP-2718 encoded bytes of the transaction.
     fn encoded_2718(&self) -> Cow<'_, Bytes>;
 
-    /// Returns state predicates required for this transaction's inclusion.
+    /// Returns submitted predicates for builder forwarding, not repeated evaluation.
     ///
-    /// Defaults to an empty slice for transaction types that do not carry
-    /// validity predicates.
+    /// Derived from [`Self::validity_conditions`] so forwarding and enforcement
+    /// use the same ingested metadata.
     fn validity_predicates(&self) -> &[crate::ValidityPredicate] {
-        &[]
+        self.validity_conditions().submitted()
     }
+
+    /// Returns the compiled conditions used for pool and builder enforcement.
+    ///
+    /// Implementations must supply their ingested metadata, or explicitly return
+    /// [`crate::ValidityConditions::empty`] when they never carry validity predicates.
+    /// This required source prevents legacy implementations from silently forwarding
+    /// predicates that are not enforced.
+    fn validity_conditions(&self) -> &crate::ValidityConditions;
 
     /// Returns the signed EIP-8130 payload when this transaction carries one.
     ///
@@ -417,6 +489,11 @@ pub trait BasePooledTx: PoolTransaction + DataAvailabilitySized {
     /// Defaults to a no-op for transaction types that do not carry a manifest.
     fn set_watch_manifest(&self, _watch_manifest: crate::WatchManifest) {}
 
+    /// Returns the attached `meter_bundle` result, if any.
+    fn metering(&self) -> Option<&MeterBundleResponse> {
+        None
+    }
+
     /// Returns whether this transaction belongs in the EIP-8130 sidecar.
     fn is_eip8130_sidecar_transaction(&self) -> bool {
         self.eip8130_nonce_channel_key().is_some() || self.eip8130_replay_id().is_some()
@@ -433,8 +510,8 @@ where
         Cow::Borrowed(self.encoded_2718())
     }
 
-    fn validity_predicates(&self) -> &[crate::ValidityPredicate] {
-        &self.validity_predicates
+    fn validity_conditions(&self) -> &crate::ValidityConditions {
+        self.validity_conditions.as_deref().unwrap_or_else(|| crate::ValidityConditions::empty())
     }
 
     fn as_eip8130(&self) -> Option<&Eip8130Signed> {
@@ -484,6 +561,10 @@ where
     fn set_limit_class(&self, limit_class: crate::LimitClass) {
         let _ = self.limit_class.set(limit_class);
     }
+
+    fn metering(&self) -> Option<&MeterBundleResponse> {
+        self.metering.as_deref()
+    }
 }
 
 /// Trait for transactions that expose their received-at timestamp.
@@ -506,11 +587,12 @@ where
 mod tests {
     use std::sync::Arc;
 
-    use alloy_consensus::transaction::Recovered;
+    use alloy_consensus::{SignableTransaction, TxEip1559, transaction::Recovered};
     use alloy_eips::eip2718::Encodable2718;
     use alloy_primitives::{Address, Bytes, TxKind, U256};
     use alloy_signer::SignerSync;
     use alloy_signer_local::PrivateKeySigner;
+    use base_bundles::{MeterBundleResponse, OpcodeGas, TransactionResult};
     use base_common_chains::ChainConfig;
     use base_common_consensus::{
         BasePooledTransaction as ConsensusPooledTransaction, BasePrimitives, BaseTransactionSigned,
@@ -530,8 +612,48 @@ mod tests {
         ValidityOperator, ValidityPredicate, WatchManifest, WatchSet,
     };
 
+    fn meter_response(results: usize) -> MeterBundleResponse {
+        MeterBundleResponse {
+            results: (0..results)
+                .map(|_| TransactionResult {
+                    coinbase_diff: U256::ZERO,
+                    eth_sent_to_coinbase: U256::ZERO,
+                    from_address: Address::ZERO,
+                    gas_fees: U256::ZERO,
+                    gas_price: U256::ZERO,
+                    gas_used: 21_000,
+                    to_address: None,
+                    tx_hash: Default::default(),
+                    value: U256::ZERO,
+                    execution_time_us: 1,
+                    opcode_gas: Vec::new(),
+                })
+                .collect(),
+            total_gas_used: 21_000 * results as u64,
+            ..MeterBundleResponse::default()
+        }
+    }
+
     fn signer() -> PrivateKeySigner {
         PrivateKeySigner::random()
+    }
+
+    fn eip1559_pooled_with_fees(
+        max_priority_fee_per_gas: u128,
+        max_fee_per_gas: u128,
+    ) -> BasePooledTransaction {
+        let signer = signer();
+        let tx = TxEip1559 {
+            chain_id: ChainConfig::mainnet().chain_id,
+            max_priority_fee_per_gas,
+            max_fee_per_gas,
+            gas_limit: 21_000,
+            to: TxKind::Call(Address::ZERO),
+            ..Default::default()
+        };
+        let signature = signer.sign_hash_sync(&tx.signature_hash()).unwrap();
+        let pooled = ConsensusPooledTransaction::Eip1559(tx.into_signed(signature));
+        BasePooledTransaction::from_pooled(Recovered::new_unchecked(pooled, signer.address()))
     }
 
     fn eip8130_pooled(nonce_key: U256) -> BasePooledTransaction {
@@ -611,22 +733,25 @@ mod tests {
         assert!(!eip8130_pooled(Eip8130Constants::NONCE_KEY_MAX).requires_nonce_check());
     }
 
-    #[test]
-    fn validity_replacement_only_requires_a_higher_max_fee() {
-        let predicate = ValidityPredicate::Balance {
+    fn balance_predicate() -> ValidityPredicate {
+        ValidityPredicate::Balance {
             address: Address::ZERO,
             op: ValidityOperator::Equal,
             value: U256::ZERO,
-        };
-        let existing = eip8130_pooled_with_fees(U256::ZERO, 10, 100)
-            .with_validity_predicates(vec![predicate.clone()]);
-        let replacement = eip8130_pooled_with_fees(U256::ZERO, 0, 101)
-            .with_validity_predicates(vec![predicate.clone()]);
+        }
+    }
+
+    #[test]
+    fn validity_replacement_only_requires_a_higher_max_fee() {
+        let existing =
+            eip1559_pooled_with_fees(10, 100).with_validity_predicates(vec![balance_predicate()]);
+        let replacement =
+            eip1559_pooled_with_fees(0, 101).with_validity_predicates(vec![balance_predicate()]);
 
         assert!(!existing.is_replacement_underpriced(&replacement, &PriceBumpConfig::default()));
 
-        let unchanged_max_fee = eip8130_pooled_with_fees(U256::ZERO, 100, 100)
-            .with_validity_predicates(vec![predicate]);
+        let unchanged_max_fee =
+            eip1559_pooled_with_fees(100, 100).with_validity_predicates(vec![balance_predicate()]);
         assert!(
             existing.is_replacement_underpriced(&unchanged_max_fee, &PriceBumpConfig::default())
         );
@@ -634,37 +759,56 @@ mod tests {
 
     #[test]
     fn validity_replacement_of_non_validity_transaction_uses_configured_price_bumps() {
-        let existing = eip8130_pooled_with_fees(U256::ZERO, 10, 100);
-        let predicate = ValidityPredicate::Balance {
-            address: Address::ZERO,
-            op: ValidityOperator::Equal,
-            value: U256::ZERO,
-        };
-        let underpriced = eip8130_pooled_with_fees(U256::ZERO, 0, 109)
-            .with_validity_predicates(vec![predicate.clone()]);
-
+        let existing = eip1559_pooled_with_fees(10, 100);
+        let underpriced =
+            eip1559_pooled_with_fees(0, 109).with_validity_predicates(vec![balance_predicate()]);
         assert!(existing.is_replacement_underpriced(&underpriced, &PriceBumpConfig::default()));
 
         let replacement =
-            eip8130_pooled_with_fees(U256::ZERO, 0, 110).with_validity_predicates(vec![predicate]);
+            eip1559_pooled_with_fees(0, 110).with_validity_predicates(vec![balance_predicate()]);
         assert!(!existing.is_replacement_underpriced(&replacement, &PriceBumpConfig::default()));
     }
 
     #[test]
-    fn non_validity_replacement_uses_configured_price_bumps() {
-        let predicate = ValidityPredicate::Balance {
-            address: Address::ZERO,
-            op: ValidityOperator::Equal,
-            value: U256::ZERO,
-        };
-        let existing =
-            eip8130_pooled_with_fees(U256::ZERO, 10, 100).with_validity_predicates(vec![predicate]);
-        let underpriced = eip8130_pooled_with_fees(U256::ZERO, 10, 110);
+    fn eip8130_replacement_requires_both_fees_to_rise() {
+        let existing = eip8130_pooled_with_fees(U256::ZERO, 10, 100);
+        let bumps = PriceBumpConfig::default();
 
-        assert!(existing.is_replacement_underpriced(&underpriced, &PriceBumpConfig::default()));
+        // A zero priority fee does not exempt the replacement from the bump.
+        assert!(
+            existing
+                .is_replacement_underpriced(&eip8130_pooled_with_fees(U256::ZERO, 0, 200), &bumps)
+        );
+        assert!(
+            existing
+                .is_replacement_underpriced(&eip8130_pooled_with_fees(U256::ZERO, 10, 110), &bumps)
+        );
+        assert!(
+            existing
+                .is_replacement_underpriced(&eip8130_pooled_with_fees(U256::ZERO, 11, 109), &bumps)
+        );
+        assert!(
+            !existing
+                .is_replacement_underpriced(&eip8130_pooled_with_fees(U256::ZERO, 11, 110), &bumps)
+        );
+    }
 
-        let replacement = eip8130_pooled_with_fees(U256::ZERO, 11, 110);
+    #[test]
+    fn eip8130_with_validity_predicates_uses_relaxed_replacement_rule() {
+        let existing = eip8130_pooled_with_fees(U256::ZERO, 10, 100)
+            .with_validity_predicates(vec![balance_predicate()]);
+        // Zero tip and a higher max fee is accepted: both transactions carry
+        // validity predicates, so the relaxed rule runs before the EIP-8130
+        // bump that requires both fee fields to rise.
+        let replacement = eip8130_pooled_with_fees(U256::ZERO, 0, 101)
+            .with_validity_predicates(vec![balance_predicate()]);
         assert!(!existing.is_replacement_underpriced(&replacement, &PriceBumpConfig::default()));
+
+        let unchanged_max_fee = eip8130_pooled_with_fees(U256::ZERO, 100, 100)
+            .with_validity_predicates(vec![balance_predicate()]);
+        assert!(
+            existing.is_replacement_underpriced(&unchanged_max_fee, &PriceBumpConfig::default())
+        );
     }
 
     #[test]
@@ -706,6 +850,118 @@ mod tests {
     }
 
     #[test]
+    fn metering_defaults_to_none() {
+        let transaction = eip8130_pooled(U256::ZERO);
+
+        assert!(transaction.metering().is_none());
+    }
+
+    #[test]
+    fn retains_metering() {
+        let metering = meter_response(1);
+        let transaction = eip8130_pooled(U256::ZERO).with_metering(metering.clone());
+
+        assert_eq!(transaction.metering(), Some(&metering));
+    }
+
+    #[test]
+    fn clone_shares_metering_arc() {
+        let transaction = eip8130_pooled(U256::ZERO).with_metering(meter_response(1));
+        let cloned = transaction.clone();
+
+        assert!(
+            core::ptr::eq(
+                transaction.metering().expect("original should retain metering"),
+                cloned.metering().expect("clone should retain metering"),
+            ),
+            "payload-building clones should share the metering Arc, not deep-copy it"
+        );
+    }
+
+    #[test]
+    fn in_memory_size_includes_metering_results() {
+        let transaction = eip8130_pooled(U256::ZERO);
+        let size_without_metering = transaction.size();
+        let metering = meter_response(2);
+        let results_size = core::mem::size_of_val(metering.results.as_slice());
+
+        let transaction = transaction.with_metering(metering);
+
+        assert_eq!(
+            transaction.size(),
+            size_without_metering + core::mem::size_of::<MeterBundleResponse>() + results_size,
+            "attaching metering should add the Arc-allocated response plus the results slice"
+        );
+        assert!(transaction.metering().is_some(), "metering should stay attached");
+    }
+
+    #[test]
+    fn in_memory_size_includes_opcode_gas_heap() {
+        let transaction = eip8130_pooled(U256::ZERO);
+        let size_without_metering = transaction.size();
+        let opcode = OpcodeGas {
+            contract_address: Address::ZERO,
+            opcode: "SSTORE".to_string(),
+            count: 1,
+            gas_used: 20_000,
+        };
+        let mut metering = meter_response(1);
+        metering.results[0].opcode_gas = vec![opcode];
+        let results_size = core::mem::size_of_val(metering.results.as_slice());
+        let opcode_gas_size = core::mem::size_of_val(metering.results[0].opcode_gas.as_slice());
+        let opcode_name_size = "SSTORE".len();
+
+        let transaction = transaction.with_metering(metering);
+
+        assert_eq!(
+            transaction.size(),
+            size_without_metering
+                + core::mem::size_of::<MeterBundleResponse>()
+                + results_size
+                + opcode_gas_size
+                + opcode_name_size,
+            "pool size should include Arc-allocated response, opcode_gas entries, and opcode name bytes"
+        );
+    }
+
+    #[test]
+    fn validity_clones_share_lossless_batch_count_and_allocated_size() {
+        let transaction = eip8130_pooled(U256::ZERO);
+        let bare_size = transaction.size();
+        let balance = ValidityPredicate::Balance {
+            address: Address::ZERO,
+            op: ValidityOperator::Equal,
+            value: U256::ZERO,
+        };
+        let block = ValidityPredicate::BlockNumber {
+            op: ValidityOperator::GreaterThan,
+            value: U256::from(9),
+        };
+        let mut submitted = Vec::with_capacity(17);
+        submitted.extend([balance.clone(), block.clone(), block, balance]);
+        let expected = submitted.clone();
+        let transaction = transaction.with_validity_predicates(submitted);
+        let cloned = transaction.clone();
+        assert!(core::ptr::eq(transaction.validity_conditions(), cloned.validity_conditions()));
+        assert_eq!(cloned.validity_predicates(), expected);
+        assert_eq!(BasePooledTx::validity_predicates(&cloned), expected);
+        assert_eq!(cloned.validity_conditions().len(), 4);
+        assert_eq!(cloned.validity_conditions().block().min(), Some(U256::from(10)));
+        assert_eq!(transaction.size(), cloned.size());
+        assert_eq!(
+            transaction.size(),
+            bare_size
+                + core::mem::size_of::<crate::ValidityConditions>()
+                + transaction.validity_conditions().heap_size()
+        );
+        assert!(
+            transaction.validity_conditions().heap_size()
+                >= 19 * core::mem::size_of::<ValidityPredicate>(),
+            "submitted spare capacity plus the two state predicates must be counted"
+        );
+    }
+
+    #[test]
     fn retains_validity_predicates() {
         let predicate = ValidityPredicate::Balance {
             address: Address::repeat_byte(1),
@@ -720,5 +976,8 @@ mod tests {
             BasePooledTx::validity_predicates(&transaction),
             core::slice::from_ref(&predicate)
         );
+        assert!(transaction.validity_conditions().contains(&predicate));
+        let cloned = transaction.clone();
+        assert!(core::ptr::eq(transaction.validity_conditions(), cloned.validity_conditions()));
     }
 }

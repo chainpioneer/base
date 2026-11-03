@@ -1,6 +1,7 @@
 use std::{
     cmp::{Ordering, min},
     env, fmt, fs,
+    num::NonZeroU64,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -20,7 +21,7 @@ use base_common_genesis::RollupConfig;
 use base_common_network::Base;
 use base_optimism_rpc::DebugProviderExt;
 use base_proof_host::HostConfig;
-use base_proof_zk_utils::{INTERMEDIATE_ROOT_INTERVAL, boot::BootInfoStruct};
+use base_proof_zk_utils::boot::BootInfoStruct;
 use base_protocol::L2BlockInfo;
 use futures::{StreamExt, stream};
 use reqwest::Url;
@@ -319,11 +320,6 @@ impl OPSuccinctDataFetcher {
     /// Finds the L1 block at the provided timestamp.
     pub async fn find_l1_block_by_timestamp(&self, target_timestamp: u64) -> Result<(B256, u64)> {
         self.find_block_by_timestamp(&self.l1_provider, target_timestamp).await
-    }
-
-    /// Finds the L2 block at the provided timestamp.
-    pub async fn find_l2_block_by_timestamp(&self, target_timestamp: u64) -> Result<(B256, u64)> {
-        self.find_block_by_timestamp(&self.l2_provider, target_timestamp).await
     }
 
     /// Finds the block at the provided timestamp, using the provided provider.
@@ -755,6 +751,7 @@ impl OPSuccinctDataFetcher {
         l2_end_block: u64,
         l1_head_hash: B256,
         schedule_l2_block_number: Option<u64>,
+        intermediate_block_interval: NonZeroU64,
     ) -> Result<HostConfig> {
         let Some(rollup_config) = &self.rollup_config else {
             return Err(anyhow::anyhow!("Rollup config not loaded."));
@@ -852,11 +849,11 @@ impl OPSuccinctDataFetcher {
             agreed_l2_head_hash,
             claimed_l2_output_root,
             claimed_l2_block_number: l2_end_block,
-            intermediate_block_interval: INTERMEDIATE_ROOT_INTERVAL,
             l1_head_number,
             // We don't need to set the proposer for the range proof zk program
             proposer: Address::ZERO,
             schedule_l2_block_number,
+            intermediate_block_interval,
         };
 
         let prover = base_proof_host::ProverConfig {
